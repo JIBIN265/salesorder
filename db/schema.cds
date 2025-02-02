@@ -2,7 +2,7 @@ using {
     cuid,
     managed
 } from '@sap/cds/common';
-using {Attachments} from '@cap-js/attachments';
+using {Attachments} from '@cap-js/sdm';
 
 namespace zsalesorder;
 

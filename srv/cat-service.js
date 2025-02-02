@@ -2,7 +2,7 @@ const cds = require('@sap/cds');
 const SequenceHelper = require("./lib/SequenceHelper");
 const FormData = require('form-data');
 const { SELECT } = require('@sap/cds/lib/ql/cds-ql');
-const { Store } = require('@sap/cds');
+const axios = require('axios');
 
 const MAX_RETRIES = 30;
 const RETRY_DELAY_MS = 3000;

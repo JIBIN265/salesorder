@@ -158,11 +158,11 @@
                             "content": {
                                 "header": {
                                     "actions": {
-                                        "UploadPdf": {
-                                            "press": "salesorder.ext.controller.FileUploadDialog.FileUploadDialog",
+                                        "ExtractPdf": {
+                                            "press": "salesorder.ext.controller.ExtractPdf.ExtractPdf",
                                             "visible": true,
                                             "enabled": true,
-                                            "text": "Upload PDF"
+                                            "text": "Extract PDF"
                                         }
                                     }
                                 }

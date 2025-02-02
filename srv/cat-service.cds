@@ -5,7 +5,7 @@ using {API_BUSINESS_PARTNER as bp} from './external/API_BUSINESS_PARTNER';
 service SalesCatalogService {
     entity salesorder             as projection on persistence.SalesOrderEntity;
     entity SalesOrderItem         as projection on persistence.SalesOrderEntity.to_Item;
-    entity attachments            as projection on persistence.SalesOrderEntity.attachments;
+    // entity attachments            as projection on persistence.SalesOrderEntity.attachments;
 
     entity ApisalesOrder          as
         projection on so.A_SalesOrder {

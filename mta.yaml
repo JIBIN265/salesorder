@@ -1,7 +1,7 @@
 _schema-version: "3.1"
 ID: salesorder
 description: Sales Order
-version: 1.0.20
+version: 1.0.21
 modules:
   - name: salesorder-srv
     type: nodejs
@@ -12,7 +12,7 @@ modules:
       - name: salesorder-logs
       - name: salesorder-connectivity
       - name: salesorder-destination-service
-      - name: salesorder-attachments
+      - name: sbpa_dms_repo
       - name: salesorder-malwarescanner
     provides:
       - name: srv-api
@@ -179,11 +179,8 @@ resources:
     parameters:
       service: connectivity
       service-plan: lite
-  - name: salesorder-attachments
-    type: org.cloudfoundry.managed-service
-    parameters:
-      service: objectstore
-      service-plan: standard
+  - name: sbpa_dms_repo
+    type: org.cloudfoundry.existing-service
   - name: salesorder-malwarescanner
     type: org.cloudfoundry.managed-service
     parameters:
