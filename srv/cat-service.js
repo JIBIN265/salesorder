@@ -37,7 +37,207 @@ class SalesCatalogService extends cds.ApplicationService {
         });
 
         this.before('SAVE', salesorder, async (req) => {
-            if (!req.data.SalesOrder) {
+
+            if (req.data.mode === 'email') {
+                const documentId = new SequenceHelper({
+                    db: db,
+                    sequence: "ZSALES_DOCUMENT_ID",
+                    table: "zsalesorder_SalesOrderEntity",
+                    field: "documentId",
+                });
+
+                let number = await documentId.getNextNumber();
+                req.data.documentId = number.toString();
+
+
+            }
+
+            else if (!req.data.SalesOrderType) {
+               
+                const allRecords = await this.run(
+                    SELECT.from(salesorder.drafts)
+                        .columns(cpx => {
+                            cpx`*`,
+                                cpx.attachments(cfy => {
+                                    cfy`content`,
+                                        cfy`mimeType`,
+                                        cfy`folderId`,
+                                        cfy`url`
+                                });
+                        })
+                        .where({
+                            ID: req.data.ID
+                        })
+                );
+
+                let fileBuffer;
+                if (allRecords[0].attachments[0].content) {
+                    try {
+                        fileBuffer = await streamToBuffer(allRecords[0].attachments[0].content);
+                    } catch (error) {
+                        req.error(400, "Error converting stream to Base64");
+                        if (req.errors) { req.reject(); }
+                    }
+
+                    //creating form data
+                    const form = new FormData();
+                    try {
+                        form.append('file', fileBuffer, req.data.attachments[0].filename || 'file', req.data.attachments[0].mimeType || 'application/octet-stream');
+                    } catch (error) {
+                        req.data.Status = error.message;
+                        req.error(400, error.message);
+                        if (req.errors) { req.reject(); }
+                    }
+
+                    const options = {
+                        schemaName: 'SAP_purchaseOrder_schema',
+                        clientId: 'default',
+                        documentType: 'Purchase Order',
+                        receivedDate: new Date().toISOString().slice(0, 10),
+                        enrichment: {
+                            sender: { top: 5, type: "businessEntity", subtype: "supplier" },
+                            employee: { type: "employee" }
+                        }
+                    };
+                    form.append('options', JSON.stringify(options));
+
+                    let status = '';
+                    let extractionResults;
+
+                    // Submit document for extraction with error handling
+                    try {
+                        const extractionResponse = await this.DocumentExtraction_Dest.send({
+                            method: 'POST',
+                            path: '/',
+                            data: form,
+                            headers: {
+                                'Content-Type': 'multipart/form-data',
+                                'Content-Length': form.getLengthSync()
+                            }
+                        });
+
+                        if (extractionResponse.status === 'PENDING') {
+                            // Poll for results
+                            let retries = 0;
+                            let jobDone = false;
+
+                            while (!jobDone && retries < MAX_RETRIES) {
+                                const jobStatus = await this.DocumentExtraction_Dest.get(`/${extractionResponse.id}`);
+                                console.log(`Attempt ${retries + 1}: Current job status is '${jobStatus.status}'`);
+
+                                if (jobStatus.status === "DONE") {
+                                    jobDone = true;
+                                    extractionResults = jobStatus.extraction;
+                                } else {
+                                    await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+                                    retries++;
+                                }
+                            }
+
+                            if (!jobDone) {
+                                req.data.Status = `Extraction failed after ${MAX_RETRIES} attempts`;
+                                return;
+                            }
+                        }
+                    } catch (error) {
+                        req.data.Status = `Document extraction failed: ${error.message}`;
+                        return;
+                    }
+
+                    // Map extraction results
+                    const headerFields = extractionResults.headerFields.reduce((acc, field) => {
+                        acc[field.name] = field.value;
+                        return acc;
+                    }, {});
+
+                    const lineItems = extractionResults.lineItems.map(item => {
+                        return item.reduce((acc, field) => {
+                            acc[field.name] = field.value;
+                            return acc;
+                        }, {});
+                    });
+
+                    const removeSpecialCharacters = (str) => {
+                        if (!str) return str;
+                        return str.replace(/[^a-zA-Z0-9\s]/g, '');
+                    };
+
+                    // Separate BP lookups with error handling
+                    let soldToResponse = null;
+                    let shipToResponse = null;
+
+                    try {
+                        soldToResponse = await this.s4HanaBP.run(
+                            SELECT.one.from('A_BusinessPartnerAddress')
+                                .where({
+                                    StreetName: removeSpecialCharacters(headerFields.senderStreet),
+                                    HouseNumber: removeSpecialCharacters(headerFields.senderHouseNumber),
+                                    CityName: removeSpecialCharacters(headerFields.senderCity),
+                                    PostalCode: removeSpecialCharacters(headerFields.senderPostalCode),
+                                    Region: removeSpecialCharacters(headerFields.senderState)
+                                })
+                        );
+                    } catch (error) {
+                        req.data.Status = `SoldTo BP lookup failed: ${error.message}`;
+                    }
+
+                    try {
+                        shipToResponse = await this.s4HanaBP.run(
+                            SELECT.one.from('A_BusinessPartnerAddress')
+                                .where({
+                                    // StreetName: removeSpecialCharacters(headerFields.shipToStreet),
+                                    HouseNumber: headerFields.shipToHouseNumber,
+                                    CityName: headerFields.shipToCity,
+                                    PostalCode: headerFields.shipToPostalCode,
+                                    Region: headerFields.shipToState,
+                                    Country: headerFields.shipToCountryCode
+                                })
+                        );
+                    } catch (error) {
+                        req.data.Status = `ShipTo BP lookup failed: ${error.message}`;
+                    }
+
+
+                    // Check if both BP lookups failed
+                    if (!soldToResponse && !shipToResponse) {
+                        req.data.Status = 'Both Business Partner lookups failed';
+                        // return;
+                    }
+
+                    // Create S4HANA sales order
+                    const salesOrderPayload = {
+                        SalesOrderType: 'OR',
+                        SoldToParty: '1000294',//soldToResponse?.BusinessPartner || shipToResponse?.BusinessPartner,
+                        TransactionCurrency: headerFields.currencyCode || '',
+                        SalesOrderDate: new Date(headerFields.documentDate || Date.now()).toISOString(),
+                        RequestedDeliveryDate: new Date(headerFields.requestedDeliveryDate || Date.now()).toISOString(),
+                        to_Item: {
+                            results: lineItems.map((item, index) => ({
+                                SalesOrderItem: String((index + 1) * 10),
+                                Material: item.customerMaterialNumber || '',
+                                SalesOrderItemText: item.description || '',
+                                RequestedQuantity: parseFloat(item.quantity) || 0
+                            }))
+                        }
+                    };
+
+                    try {
+                        const s4Response = await this.s4HanaSales.run(
+                            INSERT.into('A_SalesOrder').entries(salesOrderPayload)
+                        );
+
+                        console.log('S/4HANA response:', s4Response);
+                        req.data.SalesOrder = s4Response.SalesOrder;
+
+                    } catch (error) {
+                        req.data.Status = `S4HANA Sales Order creation failed: ${error.message}`;
+                        // return;
+                    }
+
+                }
+            }
+
+            else {
                 try {
                     const payload = {
                         SalesOrderType: req.data.SalesOrderType,
@@ -89,358 +289,358 @@ class SalesCatalogService extends cds.ApplicationService {
         });
 
 
-        this.on('processDocument', async (req) => {
-            try {
+        // this.on('processDocument', async (req) => {
+        //     try {
 
-                const decodedBuffer = Buffer.from(req.data.salesOrder.attachments[0].content, 'base64');
-                // entitySet.attachments = attachDocs;
-                const attachDocs = {
-                    mimeType: req.data.salesOrder.attachments[0].mimeType,
-                    filename: req.data.salesOrder.attachments[0].filename,
-                    content: decodedBuffer,
-                    url: req.data.salesOrder.attachments[0].url,
-                    DraftAdministrativeData_DraftUUID: cds.utils.uuid(),
-                };
-
-
-                const newSalesorder = {
-                    IsActiveEntity: false,
-                    DraftAdministrativeData_DraftUUID: cds.utils.uuid(),
-                    attachments: attachDocs
-                };
-
-                const oSalesorder = await this.send({
-                    query: INSERT.into(salesorder).entries(newSalesorder),
-                    event: "NEW",
-                });
+        //         const decodedBuffer = Buffer.from(req.data.salesOrder.attachments[0].content, 'base64');
+        //         // entitySet.attachments = attachDocs;
+        //         const attachDocs = {
+        //             mimeType: req.data.salesOrder.attachments[0].mimeType,
+        //             filename: req.data.salesOrder.attachments[0].filename,
+        //             content: decodedBuffer,
+        //             url: req.data.salesOrder.attachments[0].url,
+        //             DraftAdministrativeData_DraftUUID: cds.utils.uuid(),
+        //         };
 
 
-                // Process document
-                const attachment = req.data.salesOrder.attachments[0];
-                const form = new FormData();
-                const fileBuffer = Buffer.from(attachment.content.split(',')[1], 'base64');
-                form.append('file', fileBuffer, {
-                    filename: attachment.filename,
-                    contentType: attachment.mimeType
-                });
+        //         const newSalesorder = {
+        //             IsActiveEntity: false,
+        //             DraftAdministrativeData_DraftUUID: cds.utils.uuid(),
+        //             attachments: attachDocs
+        //         };
 
-                const options = {
-                    schemaName: 'SAP_purchaseOrder_schema',
-                    clientId: 'default',
-                    documentType: 'Purchase Order',
-                    receivedDate: new Date().toISOString().slice(0, 10),
-                    enrichment: {
-                        sender: { top: 5, type: "businessEntity", subtype: "supplier" },
-                        employee: { type: "employee" }
-                    }
-                };
-                form.append('options', JSON.stringify(options));
-
-                let status = '';
-                let extractionResults;
-
-                // Submit document for extraction with error handling
-                try {
-                    const extractionResponse = await this.DocumentExtraction_Dest.send({
-                        method: 'POST',
-                        path: '/',
-                        data: form,
-                        headers: {
-                            'Content-Type': 'multipart/form-data',
-                            'Content-Length': form.getLengthSync()
-                        }
-                    });
-
-                    if (extractionResponse.status === 'PENDING') {
-                        // Poll for results
-                        let retries = 0;
-                        let jobDone = false;
-
-                        while (!jobDone && retries < MAX_RETRIES) {
-                            const jobStatus = await this.DocumentExtraction_Dest.get(`/${extractionResponse.id}`);
-                            console.log(`Attempt ${retries + 1}: Current job status is '${jobStatus.status}'`);
-
-                            if (jobStatus.status === "DONE") {
-                                jobDone = true;
-                                extractionResults = jobStatus.extraction;
-                            } else {
-                                await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
-                                retries++;
-                            }
-                        }
-
-                        if (!jobDone) {
-                            status = `Extraction failed after ${MAX_RETRIES} attempts`;
-                            await updateDraftOnly(oSalesorder.ID, status);
-                            return;
-                        }
-                    }
-                } catch (error) {
-                    status = `Document extraction failed: ${error.message}`;
-                    await updateDraftOnly(oSalesorder.ID, status);
-                    return;
-                }
-
-                // Map extraction results
-                const headerFields = extractionResults.headerFields.reduce((acc, field) => {
-                    acc[field.name] = field.value;
-                    return acc;
-                }, {});
-
-                const lineItems = extractionResults.lineItems.map(item => {
-                    return item.reduce((acc, field) => {
-                        acc[field.name] = field.value;
-                        return acc;
-                    }, {});
-                });
-
-                const removeSpecialCharacters = (str) => {
-                    if (!str) return str;
-                    return str.replace(/[^a-zA-Z0-9\s]/g, '');
-                };
-
-                // Separate BP lookups with error handling
-                let soldToResponse = null;
-                let shipToResponse = null;
-
-                try {
-                    soldToResponse = await this.s4HanaBP.run(
-                        SELECT.one.from('A_BusinessPartnerAddress')
-                            .where({
-                                StreetName: removeSpecialCharacters(headerFields.senderStreet),
-                                HouseNumber: removeSpecialCharacters(headerFields.senderHouseNumber),
-                                CityName: removeSpecialCharacters(headerFields.senderCity),
-                                PostalCode: removeSpecialCharacters(headerFields.senderPostalCode),
-                                Region: removeSpecialCharacters(headerFields.senderState)
-                            })
-                    );
-                } catch (error) {
-                    status = `SoldTo BP lookup failed: ${error.message}`;
-                }
-
-                try {
-                    shipToResponse = await this.s4HanaBP.run(
-                        SELECT.one.from('A_BusinessPartnerAddress')
-                            .where({
-                                // StreetName: removeSpecialCharacters(headerFields.shipToStreet),
-                                HouseNumber: headerFields.shipToHouseNumber,
-                                CityName: headerFields.shipToCity,
-                                PostalCode: headerFields.shipToPostalCode,
-                                Region: headerFields.shipToState,
-                                Country: headerFields.shipToCountryCode
-                            })
-                    );
-                } catch (error) {
-                    status = `ShipTo BP lookup failed: ${error.message}`;
-                }
+        //         const oSalesorder = await this.send({
+        //             query: INSERT.into(salesorder).entries(newSalesorder),
+        //             event: "NEW",
+        //         });
 
 
-                // Check if both BP lookups failed
-                if (!soldToResponse && !shipToResponse) {
-                    status = 'Both Business Partner lookups failed';
-                    await updateDraftOnly(oSalesorder.ID, status);
-                    return;
-                }
+        //         // Process document
+        //         const attachment = req.data.salesOrder.attachments[0];
+        //         const form = new FormData();
+        //         const fileBuffer = Buffer.from(attachment.content.split(',')[1], 'base64');
+        //         form.append('file', fileBuffer, {
+        //             filename: attachment.filename,
+        //             contentType: attachment.mimeType
+        //         });
 
-                // Create S4HANA sales order
-                const salesOrderPayload = {
-                    SalesOrderType: 'OR',
-                    SoldToParty: '1000294',//soldToResponse?.BusinessPartner || shipToResponse?.BusinessPartner,
-                    TransactionCurrency: headerFields.currencyCode || '',
-                    SalesOrderDate: new Date(headerFields.documentDate || Date.now()).toISOString(),
-                    RequestedDeliveryDate: new Date(headerFields.requestedDeliveryDate || Date.now()).toISOString(),
-                    to_Item: {
-                        results: lineItems.map((item, index) => ({
-                            SalesOrderItem: String((index + 1) * 10),
-                            Material: item.customerMaterialNumber || '',
-                            SalesOrderItemText: item.description || '',
-                            RequestedQuantity: parseFloat(item.quantity) || 0
-                        }))
-                    }
-                };
+        //         const options = {
+        //             schemaName: 'SAP_purchaseOrder_schema',
+        //             clientId: 'default',
+        //             documentType: 'Purchase Order',
+        //             receivedDate: new Date().toISOString().slice(0, 10),
+        //             enrichment: {
+        //                 sender: { top: 5, type: "businessEntity", subtype: "supplier" },
+        //                 employee: { type: "employee" }
+        //             }
+        //         };
+        //         form.append('options', JSON.stringify(options));
 
-                try {
-                    const s4Response = await this.s4HanaSales.run(
-                        INSERT.into('A_SalesOrder').entries(salesOrderPayload)
-                    );
+        //         let status = '';
+        //         let extractionResults;
 
-                    const dbUpdatePayload = {
-                        SalesOrder: s4Response.SalesOrder,
-                        SalesOrderType: s4Response.SalesOrderType,
-                        SoldToParty: s4Response.SoldToParty,
-                        TransactionCurrency: s4Response.TransactionCurrency,
-                        SalesOrderDate: s4Response.SalesOrderDate,
-                        RequestedDeliveryDate: s4Response.RequestedDeliveryDate,
-                        Status: 'Sales Order Created',
-                        DraftAdministrativeData_DraftUUID: oSalesorder.DraftAdministrativeData_DraftUUID,
-                        IsActiveEntity: true
-                    };
+        //         // Submit document for extraction with error handling
+        //         try {
+        //             const extractionResponse = await this.DocumentExtraction_Dest.send({
+        //                 method: 'POST',
+        //                 path: '/',
+        //                 data: form,
+        //                 headers: {
+        //                     'Content-Type': 'multipart/form-data',
+        //                     'Content-Length': form.getLengthSync()
+        //                 }
+        //             });
 
+        //             if (extractionResponse.status === 'PENDING') {
+        //                 // Poll for results
+        //                 let retries = 0;
+        //                 let jobDone = false;
 
-                    // Update sales order draft
-                    await db.run(
-                        UPDATE(salesorder.drafts)
-                            .set(dbUpdatePayload)
-                            .where({ ID: oSalesorder.ID })
-                    );
+        //                 while (!jobDone && retries < MAX_RETRIES) {
+        //                     const jobStatus = await this.DocumentExtraction_Dest.get(`/${extractionResponse.id}`);
+        //                     console.log(`Attempt ${retries + 1}: Current job status is '${jobStatus.status}'`);
 
-                    // Get updated draft
-                    const entitySet = await db.run(
-                        SELECT.one.from(salesorder.drafts)
-                            .columns(cpx => {
-                                cpx`*`,
-                                    cpx.to_Item(cfy => { cfy`*` }),
-                                    cpx.attachments(afy => { afy`*` })
-                            })
-                            .where({ ID: oSalesorder.ID })
-                    );
+        //                     if (jobStatus.status === "DONE") {
+        //                         jobDone = true;
+        //                         extractionResults = jobStatus.extraction;
+        //                     } else {
+        //                         await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+        //                         retries++;
+        //                     }
+        //                 }
 
-                    const lineItemsPayload = lineItems.map((item, index) => ({
-                        SalesOrder: s4Response.SalesOrder,
-                        SalesOrderItem: String((index + 1) * 10),
-                        Material: item.customerMaterialNumber,
-                        SalesOrderItemText: item.description,
-                        RequestedQuantity: parseFloat(item.quantity),
-                        up__ID: oSalesorder.ID,
-                        DraftAdministrativeData_DraftUUID: cds.utils.uuid(),
-                    }));
+        //                 if (!jobDone) {
+        //                     status = `Extraction failed after ${MAX_RETRIES} attempts`;
+        //                     await updateDraftOnly(oSalesorder.ID, status);
+        //                     return;
+        //                 }
+        //             }
+        //         } catch (error) {
+        //             status = `Document extraction failed: ${error.message}`;
+        //             await updateDraftOnly(oSalesorder.ID, status);
+        //             return;
+        //         }
 
+        //         // Map extraction results
+        //         const headerFields = extractionResults.headerFields.reduce((acc, field) => {
+        //             acc[field.name] = field.value;
+        //             return acc;
+        //         }, {});
 
-                    entitySet.to_Item = lineItemsPayload;
-                    // Insert into main table and delete draft only on success
-                    await INSERT(entitySet).into(salesorder);
+        //         const lineItems = extractionResults.lineItems.map(item => {
+        //             return item.reduce((acc, field) => {
+        //                 acc[field.name] = field.value;
+        //                 return acc;
+        //             }, {});
+        //         });
 
-                    // Optional: Delete the draft after successful insertion
+        //         const removeSpecialCharacters = (str) => {
+        //             if (!str) return str;
+        //             return str.replace(/[^a-zA-Z0-9\s]/g, '');
+        //         };
 
-                    await DELETE(salesorder.drafts).where({
-                        DraftAdministrativeData_DraftUUID: oSalesorder.DraftAdministrativeData_DraftUUID,
-                    });
+        //         // Separate BP lookups with error handling
+        //         let soldToResponse = null;
+        //         let shipToResponse = null;
 
-                    req.notify("Order has been successfully created");
-                    return entitySet;
+        //         try {
+        //             soldToResponse = await this.s4HanaBP.run(
+        //                 SELECT.one.from('A_BusinessPartnerAddress')
+        //                     .where({
+        //                         StreetName: removeSpecialCharacters(headerFields.senderStreet),
+        //                         HouseNumber: removeSpecialCharacters(headerFields.senderHouseNumber),
+        //                         CityName: removeSpecialCharacters(headerFields.senderCity),
+        //                         PostalCode: removeSpecialCharacters(headerFields.senderPostalCode),
+        //                         Region: removeSpecialCharacters(headerFields.senderState)
+        //                     })
+        //             );
+        //         } catch (error) {
+        //             status = `SoldTo BP lookup failed: ${error.message}`;
+        //         }
 
-                } catch (error) {
-                    status = `S4HANA Sales Order creation failed: ${error.message}`;
-                    await updateDraftOnly(oSalesorder.ID, status);
-                    return;
-                }
-
-            } catch (error) {
-                console.error('Error in process:', error);
-                req.error(500, `Processing error: ${error.message}`);
-            }
-        });
-
-        this.on('postSalesWorkflow', async (req) => {
-
-            const newSalesorder = {
-                TransactionCurrency: req.data.currencyCode,
-                to_Item: req.data.to_Item.map(item => ({
-                    Material: item.customerMaterialNumber || '',
-                    SalesOrderItemText: item.description || '',
-                    RequestedQuantity: parseFloat(item.quantity) || 0
-                })),
-                DraftAdministrativeData_DraftUUID: cds.utils.uuid(),
-            };
-
-            const oSalesorder = await this.send({
-                query: INSERT.into(salesorder).entries(newSalesorder),
-                event: "NEW",
-            });
-            // Construct the sales order payload
-            const salesOrderPayload = {
-                SalesOrderType: 'OR',
-                SoldToParty: '1000294', // Use the relevant party data
-                TransactionCurrency: req.data.currencyCode || '',
-                SalesOrderDate: new Date(req.data.documentDate || Date.now()).toISOString(),
-                RequestedDeliveryDate: new Date(req.data.requestedDeliveryDate || Date.now()).toISOString(),
-                to_Item: {
-                    results: req.data.to_Item.map((item, index) => ({
-                        SalesOrderItem: String((index + 1) * 10),
-                        Material: item.customerMaterialNumber || '',
-                        SalesOrderItemText: item.description || '',
-                        RequestedQuantity: parseFloat(item.quantity) || 0
-                    }))
-                }
-            };
-
-            try {
-                const s4Response = await this.s4HanaSales.run(
-                    INSERT.into('A_SalesOrder').entries(salesOrderPayload)
-                );
-
-                const dbUpdatePayload = {
-                    SalesOrder: s4Response.SalesOrder,
-                    SalesOrderType: s4Response.SalesOrderType,
-                    SoldToParty: s4Response.SoldToParty,
-                    TransactionCurrency: s4Response.TransactionCurrency,
-                    SalesOrderDate: s4Response.SalesOrderDate,
-                    RequestedDeliveryDate: s4Response.RequestedDeliveryDate,
-                    Status: 'Sales Order Created',
-                    DraftAdministrativeData_DraftUUID: oSalesorder.DraftAdministrativeData_DraftUUID,
-                    IsActiveEntity: true
-                };
+        //         try {
+        //             shipToResponse = await this.s4HanaBP.run(
+        //                 SELECT.one.from('A_BusinessPartnerAddress')
+        //                     .where({
+        //                         // StreetName: removeSpecialCharacters(headerFields.shipToStreet),
+        //                         HouseNumber: headerFields.shipToHouseNumber,
+        //                         CityName: headerFields.shipToCity,
+        //                         PostalCode: headerFields.shipToPostalCode,
+        //                         Region: headerFields.shipToState,
+        //                         Country: headerFields.shipToCountryCode
+        //                     })
+        //             );
+        //         } catch (error) {
+        //             status = `ShipTo BP lookup failed: ${error.message}`;
+        //         }
 
 
-                // Update sales order draft
-                await db.run(
-                    UPDATE(salesorder.drafts)
-                        .set(dbUpdatePayload)
-                        .where({ ID: oSalesorder.ID })
-                );
+        //         // Check if both BP lookups failed
+        //         if (!soldToResponse && !shipToResponse) {
+        //             status = 'Both Business Partner lookups failed';
+        //             await updateDraftOnly(oSalesorder.ID, status);
+        //             return;
+        //         }
 
-                // Get updated draft
-                const entitySet = await db.run(
-                    SELECT.one.from(salesorder.drafts)
-                        .columns(cpx => {
-                            cpx`*`,
-                                cpx.to_Item(cfy => { cfy`*` }),
-                                cpx.attachments(afy => { afy`*` })
-                        })
-                        .where({ ID: oSalesorder.ID })
-                );
+        //         // Create S4HANA sales order
+        //         const salesOrderPayload = {
+        //             SalesOrderType: 'OR',
+        //             SoldToParty: '1000294',//soldToResponse?.BusinessPartner || shipToResponse?.BusinessPartner,
+        //             TransactionCurrency: headerFields.currencyCode || '',
+        //             SalesOrderDate: new Date(headerFields.documentDate || Date.now()).toISOString(),
+        //             RequestedDeliveryDate: new Date(headerFields.requestedDeliveryDate || Date.now()).toISOString(),
+        //             to_Item: {
+        //                 results: lineItems.map((item, index) => ({
+        //                     SalesOrderItem: String((index + 1) * 10),
+        //                     Material: item.customerMaterialNumber || '',
+        //                     SalesOrderItemText: item.description || '',
+        //                     RequestedQuantity: parseFloat(item.quantity) || 0
+        //                 }))
+        //             }
+        //         };
 
-                const lineItemsPayload = lineItems.map((item, index) => ({
-                    SalesOrder: s4Response.SalesOrder, 
-                    SalesOrderItem: String((index + 1) * 10),
-                    Material: item.customerMaterialNumber,
-                    SalesOrderItemText: item.description,
-                    RequestedQuantity: parseFloat(item.quantity),
-                    up__ID: oSalesorder.ID,
-                    DraftAdministrativeData_DraftUUID: cds.utils.uuid(),
-                }));
+        //         try {
+        //             const s4Response = await this.s4HanaSales.run(
+        //                 INSERT.into('A_SalesOrder').entries(salesOrderPayload)
+        //             );
+
+        //             const dbUpdatePayload = {
+        //                 SalesOrder: s4Response.SalesOrder,
+        //                 SalesOrderType: s4Response.SalesOrderType,
+        //                 SoldToParty: s4Response.SoldToParty,
+        //                 TransactionCurrency: s4Response.TransactionCurrency,
+        //                 SalesOrderDate: s4Response.SalesOrderDate,
+        //                 RequestedDeliveryDate: s4Response.RequestedDeliveryDate,
+        //                 Status: 'Sales Order Created',
+        //                 DraftAdministrativeData_DraftUUID: oSalesorder.DraftAdministrativeData_DraftUUID,
+        //                 IsActiveEntity: true
+        //             };
 
 
-                entitySet.to_Item = lineItemsPayload;
-                // Insert into main table and delete draft only on success
-                await INSERT(entitySet).into(salesorder);
+        //             // Update sales order draft
+        //             await db.run(
+        //                 UPDATE(salesorder.drafts)
+        //                     .set(dbUpdatePayload)
+        //                     .where({ ID: oSalesorder.ID })
+        //             );
 
-                await DELETE(salesorder.drafts).where({
-                    DraftAdministrativeData_DraftUUID: oSalesorder.DraftAdministrativeData_DraftUUID,
-                });
-                return {
-                    message: 'Sales Order Successfully Created',
-                    indicator: 'Y',
-                    salesorder: s4Response.SalesOrder
-                };
+        //             // Get updated draft
+        //             const entitySet = await db.run(
+        //                 SELECT.one.from(salesorder.drafts)
+        //                     .columns(cpx => {
+        //                         cpx`*`,
+        //                             cpx.to_Item(cfy => { cfy`*` }),
+        //                             cpx.attachments(afy => { afy`*` })
+        //                     })
+        //                     .where({ ID: oSalesorder.ID })
+        //             );
 
-            } catch (error) {
-                await updateDraftOnly(oSalesorder.ID, `S4HANA Sales Order creation failed: ${error.message}`);
-                return {
-                    message: `S4HANA Sales Order creation failed: ${error.message}`,
-                    indicator: 'N',
-                }
-            }
-        });
+        //             const lineItemsPayload = lineItems.map((item, index) => ({
+        //                 SalesOrder: s4Response.SalesOrder,
+        //                 SalesOrderItem: String((index + 1) * 10),
+        //                 Material: item.customerMaterialNumber,
+        //                 SalesOrderItemText: item.description,
+        //                 RequestedQuantity: parseFloat(item.quantity),
+        //                 up__ID: oSalesorder.ID,
+        //                 DraftAdministrativeData_DraftUUID: cds.utils.uuid(),
+        //             }));
+
+
+        //             entitySet.to_Item = lineItemsPayload;
+        //             // Insert into main table and delete draft only on success
+        //             await INSERT(entitySet).into(salesorder);
+
+        //             // Optional: Delete the draft after successful insertion
+
+        //             await DELETE(salesorder.drafts).where({
+        //                 DraftAdministrativeData_DraftUUID: oSalesorder.DraftAdministrativeData_DraftUUID,
+        //             });
+
+        //             req.notify("Order has been successfully created");
+        //             return entitySet;
+
+        //         } catch (error) {
+        //             status = `S4HANA Sales Order creation failed: ${error.message}`;
+        //             await updateDraftOnly(oSalesorder.ID, status);
+        //             return;
+        //         }
+
+        //     } catch (error) {
+        //         console.error('Error in process:', error);
+        //         req.error(500, `Processing error: ${error.message}`);
+        //     }
+        // });
+
+        // this.on('postSalesWorkflow', async (req) => {
+
+        //     const newSalesorder = {
+        //         TransactionCurrency: req.data.currencyCode,
+        //         to_Item: req.data.to_Item.map(item => ({
+        //             Material: item.customerMaterialNumber || '',
+        //             SalesOrderItemText: item.description || '',
+        //             RequestedQuantity: parseFloat(item.quantity) || 0
+        //         })),
+        //         DraftAdministrativeData_DraftUUID: cds.utils.uuid(),
+        //     };
+
+        //     const oSalesorder = await this.send({
+        //         query: INSERT.into(salesorder).entries(newSalesorder),
+        //         event: "NEW",
+        //     });
+        //     // Construct the sales order payload
+        //     const salesOrderPayload = {
+        //         SalesOrderType: 'OR',
+        //         SoldToParty: '1000294', // Use the relevant party data
+        //         TransactionCurrency: req.data.currencyCode || '',
+        //         SalesOrderDate: new Date(req.data.documentDate || Date.now()).toISOString(),
+        //         RequestedDeliveryDate: new Date(req.data.requestedDeliveryDate || Date.now()).toISOString(),
+        //         to_Item: {
+        //             results: req.data.to_Item.map((item, index) => ({
+        //                 SalesOrderItem: String((index + 1) * 10),
+        //                 Material: item.customerMaterialNumber || '',
+        //                 SalesOrderItemText: item.description || '',
+        //                 RequestedQuantity: parseFloat(item.quantity) || 0
+        //             }))
+        //         }
+        //     };
+
+        //     try {
+        //         const s4Response = await this.s4HanaSales.run(
+        //             INSERT.into('A_SalesOrder').entries(salesOrderPayload)
+        //         );
+
+        //         const dbUpdatePayload = {
+        //             SalesOrder: s4Response.SalesOrder,
+        //             SalesOrderType: s4Response.SalesOrderType,
+        //             SoldToParty: s4Response.SoldToParty,
+        //             TransactionCurrency: s4Response.TransactionCurrency,
+        //             SalesOrderDate: s4Response.SalesOrderDate,
+        //             RequestedDeliveryDate: s4Response.RequestedDeliveryDate,
+        //             Status: 'Sales Order Created',
+        //             DraftAdministrativeData_DraftUUID: oSalesorder.DraftAdministrativeData_DraftUUID,
+        //             IsActiveEntity: true
+        //         };
+
+
+        //         // Update sales order draft
+        //         await db.run(
+        //             UPDATE(salesorder.drafts)
+        //                 .set(dbUpdatePayload)
+        //                 .where({ ID: oSalesorder.ID })
+        //         );
+
+        //         // Get updated draft
+        //         const entitySet = await db.run(
+        //             SELECT.one.from(salesorder.drafts)
+        //                 .columns(cpx => {
+        //                     cpx`*`,
+        //                         cpx.to_Item(cfy => { cfy`*` }),
+        //                         cpx.attachments(afy => { afy`*` })
+        //                 })
+        //                 .where({ ID: oSalesorder.ID })
+        //         );
+
+        //         const lineItemsPayload = lineItems.map((item, index) => ({
+        //             SalesOrder: s4Response.SalesOrder,
+        //             SalesOrderItem: String((index + 1) * 10),
+        //             Material: item.customerMaterialNumber,
+        //             SalesOrderItemText: item.description,
+        //             RequestedQuantity: parseFloat(item.quantity),
+        //             up__ID: oSalesorder.ID,
+        //             DraftAdministrativeData_DraftUUID: cds.utils.uuid(),
+        //         }));
+
+
+        //         entitySet.to_Item = lineItemsPayload;
+        //         // Insert into main table and delete draft only on success
+        //         await INSERT(entitySet).into(salesorder);
+
+        //         await DELETE(salesorder.drafts).where({
+        //             DraftAdministrativeData_DraftUUID: oSalesorder.DraftAdministrativeData_DraftUUID,
+        //         });
+        //         return {
+        //             message: 'Sales Order Successfully Created',
+        //             indicator: 'Y',
+        //             salesorder: s4Response.SalesOrder
+        //         };
+
+        //     } catch (error) {
+        //         await updateDraftOnly(oSalesorder.ID, `S4HANA Sales Order creation failed: ${error.message}`);
+        //         return {
+        //             message: `S4HANA Sales Order creation failed: ${error.message}`,
+        //             indicator: 'N',
+        //         }
+        //     }
+        // });
 
         // Helper function to update draft status without creating final record
-        async function updateDraftOnly(ID, status) {
-            await db.run(
-                UPDATE(salesorder.drafts)
-                    .set({ Status: status })
-                    .where({ ID: ID })
-            );
-        }
+        // async function updateDraftOnly(ID, status) {
+        //     await db.run(
+        //         UPDATE(salesorder.drafts)
+        //             .set({ Status: status })
+        //             .where({ ID: ID })
+        //     );
+        // }
 
 
         await super.init();

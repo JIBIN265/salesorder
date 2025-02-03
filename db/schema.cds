@@ -25,6 +25,7 @@ entity SalesOrderEntity : cuid, managed {
     IncotermsLocation1        : String(100);
     CustomerPaymentTerms      : String(4);
     Status                    : String(200);
+    mode                      : String(7);
     to_Item                   : Composition of many SalesOrderItemEntity;
     attachments               : Composition of many Attachments;
 }

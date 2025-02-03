@@ -1,7 +1,7 @@
 _schema-version: "3.1"
 ID: salesorder
 description: Sales Order
-version: 1.0.21
+version: 1.0.0
 modules:
   - name: salesorder-srv
     type: nodejs
@@ -194,6 +194,5 @@ build-parameters:
   before-all:
     - builder: custom
       commands:
-        - npm ci
         - npx cds build --production
         - npx rimraf gen/db/src/gen/data
