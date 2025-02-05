@@ -2,10 +2,12 @@ const cds = require('@sap/cds');
 const SequenceHelper = require("./lib/SequenceHelper");
 const FormData = require('form-data');
 const { SELECT } = require('@sap/cds/lib/ql/cds-ql');
-const axios = require('axios');
-
+const LOG = cds.log('cat-service.js')
+const axios = require("axios");
+const { S3Client, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const MAX_RETRIES = 30;
 const RETRY_DELAY_MS = 3000;
+const { retrieveJwt, getDestination } = require("@sap-cloud-sdk/connectivity");
 
 class SalesCatalogService extends cds.ApplicationService {
     async init() {
@@ -36,6 +38,75 @@ class SalesCatalogService extends cds.ApplicationService {
             req.data.documentId = documentId.toString();
         });
 
+        this.on('copySalesorder', async (req) => {
+            const { ID } = req.params[0];
+            const originalsalesorder = await db.run(
+                SELECT.one.from(salesorder)
+                    .columns(inv => {
+                        inv`*`,                   // Select all columns from salesorder
+                            inv.to_Item(int => { int`*` }) // Select all columns from salesorder Item
+                    })
+                    .where({ ID: ID })
+            );
+
+            if (!originalsalesorder) {
+                const draftsalesorder = await db.run(
+                    SELECT.one.from(salesorder.drafts)
+                        .columns(inv => {
+                            inv`*`,                   // Select all columns from salesorder
+                                inv.to_Item(int => { int`*` }) // Select all columns from salesorder Item
+                        })
+                        .where({ ID: ID })
+                );
+                if (draftsalesorder) {
+                    req.error(404, 'You cannot copy a Draft Order');
+                }
+                else {
+                    req.error(404, 'Please contact SAP IT');
+                }
+                if (req.errors) { req.reject(); }
+            }
+
+            const copiedsalesorder = Object.assign({}, originalsalesorder);
+            delete copiedsalesorder.ID;  // Remove the ID to ensure a new entity is created
+            delete copiedsalesorder.createdAt;
+            delete copiedsalesorder.createdBy;
+            delete copiedsalesorder.modifiedAt;
+            delete copiedsalesorder.modifiedBy;
+            delete copiedsalesorder.HasActiveEntity;
+            delete copiedsalesorder.HasDraftEntity;
+            delete copiedsalesorder.IsActiveEntity;
+            copiedsalesorder.DraftAdministrativeData_DraftUUID = cds.utils.uuid();
+            // Ensure all related entities are copied
+            if (originalsalesorder.to_Item) {
+                copiedsalesorder.to_Item = originalsalesorder.to_Item.map(salesorderItem => {
+                    const copiedsalesorderItem = Object.assign({}, salesorderItem);
+                    delete copiedsalesorderItem.ID; // Remove the ID to create a new related entity
+                    delete copiedsalesorderItem.up__ID;
+                    delete copiedsalesorderItem.createdAt;
+                    delete copiedsalesorderItem.createdBy;
+                    delete copiedsalesorderItem.modifiedAt;
+                    delete copiedsalesorderItem.modifiedBy;
+                    copiedsalesorderItem.DraftAdministrativeData_DraftUUID = cds.utils.uuid();
+                    return copiedsalesorderItem;
+                });
+            }
+            //create a draft
+            const osalesorder = await this.send({
+                query: INSERT.into(salesorder).entries(copiedsalesorder),
+                event: "NEW",
+            });
+
+            //return the draft
+            if (!osalesorder) {
+                req.notify("Copy failed");
+            }
+            else {
+                req.notify("Order has been successfully copied and saved as a new draft.");
+            }
+
+        });
+
         this.before('SAVE', salesorder, async (req) => {
 
             if (req.data.mode === 'email') {
@@ -53,7 +124,7 @@ class SalesCatalogService extends cds.ApplicationService {
             }
 
             else if (!req.data.SalesOrderType) {
-               
+
                 const allRecords = await this.run(
                     SELECT.from(salesorder.drafts)
                         .columns(cpx => {
@@ -157,82 +228,147 @@ class SalesCatalogService extends cds.ApplicationService {
                         }, {});
                     });
 
-                    const removeSpecialCharacters = (str) => {
-                        if (!str) return str;
-                        return str.replace(/[^a-zA-Z0-9\s]/g, '');
-                    };
+                    const today = new Date();
+                    const futureDate = new Date();
+                    futureDate.setDate(today.getDate() + 10);
+                    req.data.SalesOrderType = "OR";
+                    req.data.SoldToParty = "29100001";
+                    req.data.TransactionCurrency = headerFields.currencyCode;
+                    req.data.SalesOrderDate = today.toISOString().split('T')[0];
+                    req.data.RequestedDeliveryDate = futureDate.toISOString().split('T')[0];
+                    req.data.to_Item = lineItems.map((lineItem, index) => ({
+                        SalesOrderItem: (index + 1).toString().padStart(5, "0"),
+                        Material: lineItem.customerMaterialNumber,
+                        SalesOrderItemText: lineItem.description,
+                        RequestedQuantity: lineItem.quantity,
+                        RequestedQuantityUnit: "PC"
+                    }));
+
+                    try {
+                        const payload = {
+                            SalesOrderType: req.data.SalesOrderType,
+                            // SalesOrganization: req.data.SalesOrganization,
+                            // DistributionChannel: req.data.DistributionChannel,
+                            // OrganizationDivision: req.data.OrganizationDivision,
+                            SoldToParty: req.data.SoldToParty,
+                            // PurchaseOrderByCustomer: req.data.PurchaseOrderByCustomer,
+                            TransactionCurrency: req.data.TransactionCurrency,
+                            SalesOrderDate: new Date(req.data.SalesOrderDate).toISOString(),
+                            // PricingDate: new Date(req.data.PricingDate).toISOString(),
+                            RequestedDeliveryDate: new Date(req.data.RequestedDeliveryDate).toISOString(),
+                            // ShippingCondition: req.data.ShippingCondition,
+                            // CompleteDeliveryIsDefined: req.data.CompleteDeliveryIsDefined ?? false,
+                            // IncotermsClassification: req.data.IncotermsClassification,
+                            // IncotermsLocation1: req.data.IncotermsLocation1,
+                            // CustomerPaymentTerms: req.data.CustomerPaymentTerms,
+                            to_Item: {
+                                results: req.data.to_Item.map(item => ({
+                                    SalesOrderItem: item.SalesOrderItem,
+                                    Material: item.Material,
+                                    SalesOrderItemText: item.SalesOrderItemText,
+                                    RequestedQuantity: item.RequestedQuantity,
+                                    RequestedQuantityUnit: item.RequestedQuantityUnit,
+                                    // ItemGrossWeight: item.ItemGrossWeight,
+                                    // ItemNetWeight: item.ItemNetWeight,
+                                    // ItemWeightUnit: item.ItemWeightUnit,
+                                    // NetAmount: item.NetAmount,
+                                    // MaterialGroup: item.MaterialGroup,
+                                    // ProductionPlant: item.ProductionPlant,
+                                    // StorageLocation: item.StorageLocation,
+                                    // DeliveryGroup: item.DeliveryGroup,
+                                    // ShippingPoint: item.ShippingPoint
+                                }))
+                            }
+                        };
+
+                        const response = await this.s4HanaSales.run(
+                            INSERT.into('A_SalesOrder').entries(payload)
+                        );
+
+                        console.log('S/4HANA response:', response);
+                        req.data.SalesOrder = response.SalesOrder;
+                        req.data.SalesOrganization = response.SalesOrganization;
+                    } catch (error) {
+                        console.error('Error posting to S/4HANA:', error.message);
+                        req.error(500, 'Failed to create sales order in S/4HANA', error.message);
+                    }
+
+                    // const removeSpecialCharacters = (str) => {
+                    //     if (!str) return str;
+                    //     return str.replace(/[^a-zA-Z0-9\s]/g, '');
+                    // };
 
                     // Separate BP lookups with error handling
-                    let soldToResponse = null;
-                    let shipToResponse = null;
+                    // let soldToResponse = null;
+                    // let shipToResponse = null;
 
-                    try {
-                        soldToResponse = await this.s4HanaBP.run(
-                            SELECT.one.from('A_BusinessPartnerAddress')
-                                .where({
-                                    StreetName: removeSpecialCharacters(headerFields.senderStreet),
-                                    HouseNumber: removeSpecialCharacters(headerFields.senderHouseNumber),
-                                    CityName: removeSpecialCharacters(headerFields.senderCity),
-                                    PostalCode: removeSpecialCharacters(headerFields.senderPostalCode),
-                                    Region: removeSpecialCharacters(headerFields.senderState)
-                                })
-                        );
-                    } catch (error) {
-                        req.data.Status = `SoldTo BP lookup failed: ${error.message}`;
-                    }
+                    // try {
+                    //     soldToResponse = await this.s4HanaBP.run(
+                    //         SELECT.one.from('A_BusinessPartnerAddress')
+                    //             .where({
+                    //                 StreetName: removeSpecialCharacters(headerFields.senderStreet),
+                    //                 HouseNumber: removeSpecialCharacters(headerFields.senderHouseNumber),
+                    //                 CityName: removeSpecialCharacters(headerFields.senderCity),
+                    //                 PostalCode: removeSpecialCharacters(headerFields.senderPostalCode),
+                    //                 Region: removeSpecialCharacters(headerFields.senderState)
+                    //             })
+                    //     );
+                    // } catch (error) {
+                    //     req.data.Status = `SoldTo BP lookup failed: ${error.message}`;
+                    // }
 
-                    try {
-                        shipToResponse = await this.s4HanaBP.run(
-                            SELECT.one.from('A_BusinessPartnerAddress')
-                                .where({
-                                    // StreetName: removeSpecialCharacters(headerFields.shipToStreet),
-                                    HouseNumber: headerFields.shipToHouseNumber,
-                                    CityName: headerFields.shipToCity,
-                                    PostalCode: headerFields.shipToPostalCode,
-                                    Region: headerFields.shipToState,
-                                    Country: headerFields.shipToCountryCode
-                                })
-                        );
-                    } catch (error) {
-                        req.data.Status = `ShipTo BP lookup failed: ${error.message}`;
-                    }
+                    // try {
+                    //     shipToResponse = await this.s4HanaBP.run(
+                    //         SELECT.one.from('A_BusinessPartnerAddress')
+                    //             .where({
+                    //                 // StreetName: removeSpecialCharacters(headerFields.shipToStreet),
+                    //                 HouseNumber: headerFields.shipToHouseNumber,
+                    //                 CityName: headerFields.shipToCity,
+                    //                 PostalCode: headerFields.shipToPostalCode,
+                    //                 Region: headerFields.shipToState,
+                    //                 Country: headerFields.shipToCountryCode
+                    //             })
+                    //     );
+                    // } catch (error) {
+                    //     req.data.Status = `ShipTo BP lookup failed: ${error.message}`;
+                    // }
 
 
-                    // Check if both BP lookups failed
-                    if (!soldToResponse && !shipToResponse) {
-                        req.data.Status = 'Both Business Partner lookups failed';
-                        // return;
-                    }
+                    // // Check if both BP lookups failed
+                    // if (!soldToResponse && !shipToResponse) {
+                    //     req.data.Status = 'Both Business Partner lookups failed';
+                    //     // return;
+                    // }
 
                     // Create S4HANA sales order
-                    const salesOrderPayload = {
-                        SalesOrderType: 'OR',
-                        SoldToParty: '1000294',//soldToResponse?.BusinessPartner || shipToResponse?.BusinessPartner,
-                        TransactionCurrency: headerFields.currencyCode || '',
-                        SalesOrderDate: new Date(headerFields.documentDate || Date.now()).toISOString(),
-                        RequestedDeliveryDate: new Date(headerFields.requestedDeliveryDate || Date.now()).toISOString(),
-                        to_Item: {
-                            results: lineItems.map((item, index) => ({
-                                SalesOrderItem: String((index + 1) * 10),
-                                Material: item.customerMaterialNumber || '',
-                                SalesOrderItemText: item.description || '',
-                                RequestedQuantity: parseFloat(item.quantity) || 0
-                            }))
-                        }
-                    };
+                    // const salesOrderPayload = {
+                    //     SalesOrderType: 'OR',
+                    //     SoldToParty: '1000294',//soldToResponse?.BusinessPartner || shipToResponse?.BusinessPartner,
+                    //     TransactionCurrency: headerFields.currencyCode || '',
+                    //     SalesOrderDate: new Date(headerFields.documentDate || Date.now()).toISOString(),
+                    //     RequestedDeliveryDate: new Date(headerFields.requestedDeliveryDate || Date.now()).toISOString(),
+                    //     to_Item: {
+                    //         results: lineItems.map((item, index) => ({
+                    //             SalesOrderItem: String((index + 1) * 10),
+                    //             Material: item.customerMaterialNumber || '',
+                    //             SalesOrderItemText: item.description || '',
+                    //             RequestedQuantity: parseFloat(item.quantity) || 0
+                    //         }))
+                    //     }
+                    // };
 
-                    try {
-                        const s4Response = await this.s4HanaSales.run(
-                            INSERT.into('A_SalesOrder').entries(salesOrderPayload)
-                        );
+                    // try {
+                    //     const s4Response = await this.s4HanaSales.run(
+                    //         INSERT.into('A_SalesOrder').entries(salesOrderPayload)
+                    //     );
 
-                        console.log('S/4HANA response:', s4Response);
-                        req.data.SalesOrder = s4Response.SalesOrder;
+                    //     console.log('S/4HANA response:', s4Response);
+                    //     req.data.SalesOrder = s4Response.SalesOrder;
 
-                    } catch (error) {
-                        req.data.Status = `S4HANA Sales Order creation failed: ${error.message}`;
-                        // return;
-                    }
+                    // } catch (error) {
+                    //     req.data.Status = `S4HANA Sales Order creation failed: ${error.message}`;
+                    //     // return;
+                    // }
 
                 }
             }
@@ -241,20 +377,20 @@ class SalesCatalogService extends cds.ApplicationService {
                 try {
                     const payload = {
                         SalesOrderType: req.data.SalesOrderType,
-                        SalesOrganization: req.data.SalesOrganization,
-                        DistributionChannel: req.data.DistributionChannel,
-                        OrganizationDivision: req.data.OrganizationDivision,
+                        // SalesOrganization: req.data.SalesOrganization,
+                        // DistributionChannel: req.data.DistributionChannel,
+                        // OrganizationDivision: req.data.OrganizationDivision,
                         SoldToParty: req.data.SoldToParty,
-                        PurchaseOrderByCustomer: req.data.PurchaseOrderByCustomer,
+                        // PurchaseOrderByCustomer: req.data.PurchaseOrderByCustomer,
                         TransactionCurrency: req.data.TransactionCurrency,
                         SalesOrderDate: new Date(req.data.SalesOrderDate).toISOString(),
-                        PricingDate: new Date(req.data.PricingDate).toISOString(),
+                        // PricingDate: new Date(req.data.PricingDate).toISOString(),
                         RequestedDeliveryDate: new Date(req.data.RequestedDeliveryDate).toISOString(),
-                        ShippingCondition: req.data.ShippingCondition,
-                        CompleteDeliveryIsDefined: req.data.CompleteDeliveryIsDefined ?? false,
-                        IncotermsClassification: req.data.IncotermsClassification,
-                        IncotermsLocation1: req.data.IncotermsLocation1,
-                        CustomerPaymentTerms: req.data.CustomerPaymentTerms,
+                        // ShippingCondition: req.data.ShippingCondition,
+                        // CompleteDeliveryIsDefined: req.data.CompleteDeliveryIsDefined ?? false,
+                        // IncotermsClassification: req.data.IncotermsClassification,
+                        // IncotermsLocation1: req.data.IncotermsLocation1,
+                        // CustomerPaymentTerms: req.data.CustomerPaymentTerms,
                         to_Item: {
                             results: req.data.to_Item.map(item => ({
                                 SalesOrderItem: item.SalesOrderItem,
@@ -262,15 +398,15 @@ class SalesCatalogService extends cds.ApplicationService {
                                 SalesOrderItemText: item.SalesOrderItemText,
                                 RequestedQuantity: item.RequestedQuantity,
                                 RequestedQuantityUnit: item.RequestedQuantityUnit,
-                                ItemGrossWeight: item.ItemGrossWeight,
-                                ItemNetWeight: item.ItemNetWeight,
-                                ItemWeightUnit: item.ItemWeightUnit,
-                                NetAmount: item.NetAmount,
-                                MaterialGroup: item.MaterialGroup,
-                                ProductionPlant: item.ProductionPlant,
-                                StorageLocation: item.StorageLocation,
-                                DeliveryGroup: item.DeliveryGroup,
-                                ShippingPoint: item.ShippingPoint
+                                // ItemGrossWeight: item.ItemGrossWeight,
+                                // ItemNetWeight: item.ItemNetWeight,
+                                // ItemWeightUnit: item.ItemWeightUnit,
+                                // NetAmount: item.NetAmount,
+                                // MaterialGroup: item.MaterialGroup,
+                                // ProductionPlant: item.ProductionPlant,
+                                // StorageLocation: item.StorageLocation,
+                                // DeliveryGroup: item.DeliveryGroup,
+                                // ShippingPoint: item.ShippingPoint
                             }))
                         }
                     };
@@ -281,6 +417,7 @@ class SalesCatalogService extends cds.ApplicationService {
 
                     console.log('S/4HANA response:', response);
                     req.data.SalesOrder = response.SalesOrder;
+                    req.data.SalesOrganization = response.SalesOrganization;
                 } catch (error) {
                     console.error('Error posting to S/4HANA:', error);
                     req.error(500, 'Failed to create sales order in S/4HANA', error);
@@ -288,6 +425,14 @@ class SalesCatalogService extends cds.ApplicationService {
             }
         });
 
+        async function streamToBuffer(stream) {
+            return new Promise((resolve, reject) => {
+                const chunks = [];
+                stream.on('data', (chunk) => chunks.push(Buffer.from(chunk))); // Collect chunks as Buffers
+                stream.on('error', (err) => reject(err)); // Handle errors
+                stream.on('end', () => resolve(Buffer.concat(chunks))); // Resolve final Buffer
+            });
+        }
 
         // this.on('processDocument', async (req) => {
         //     try {

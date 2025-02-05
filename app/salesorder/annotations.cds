@@ -57,6 +57,11 @@ annotate service.salesorder with
         Value: TransactionCurrency,
         Label: '{i18n>TransactionCurrency}',
     },
+    {
+        $Type : 'UI.DataFieldForAction',
+        Action : 'SalesCatalogService.copySalesorder',
+        Label : '{i18n>Copy}',
+    },
 ]);
 
 annotate service.salesorder with @(
@@ -67,6 +72,26 @@ annotate service.salesorder with @(
                 $Type: 'UI.DataField',
                 Label: '{i18n>SalesOrderType}',
                 Value: SalesOrderType,
+            },
+            {
+                $Type: 'UI.DataField',
+                Label: 'Sold To Party',
+                Value: SoldToParty,
+            },
+            {
+                $Type: 'UI.DataField',
+                Label: '{i18n>TransactionCurrency}',
+                Value: TransactionCurrency,
+            },
+            {
+                $Type: 'UI.DataField',
+                Label: '{i18n>SalesOrderDate}',
+                Value: SalesOrderDate,
+            },
+            {
+                $Type: 'UI.DataField',
+                Label: '{i18n>RequestedDeliveryDate}',
+                Value: RequestedDeliveryDate,
             },
             {
                 $Type: 'UI.DataField',
@@ -85,33 +110,8 @@ annotate service.salesorder with @(
             },
             {
                 $Type: 'UI.DataField',
-                Label: 'Sold To Party',
-                Value: SoldToParty,
-            },
-            {
-                $Type: 'UI.DataField',
-                Label: '{i18n>PurchaseOrderByCustomer1}',
-                Value: PurchaseOrderByCustomer,
-            },
-            {
-                $Type: 'UI.DataField',
-                Label: '{i18n>SalesOrderDate}',
-                Value: SalesOrderDate,
-            },
-            {
-                $Type: 'UI.DataField',
-                Label: '{i18n>TransactionCurrency}',
-                Value: TransactionCurrency,
-            },
-            {
-                $Type: 'UI.DataField',
                 Label: '{i18n>PricingDate}',
                 Value: PricingDate,
-            },
-            {
-                $Type: 'UI.DataField',
-                Label: '{i18n>RequestedDeliveryDate}',
-                Value: RequestedDeliveryDate,
             },
             {
                 $Type: 'UI.DataField',
@@ -132,6 +132,11 @@ annotate service.salesorder with @(
                 $Type: 'UI.DataField',
                 Label: '{i18n>IncotermsLocation1}',
                 Value: IncotermsLocation1,
+            },
+            {
+                $Type: 'UI.DataField',
+                Label: '{i18n>PurchaseOrderByCustomer1}',
+                Value: PurchaseOrderByCustomer,
             },
             {
                 $Type: 'UI.DataField',
@@ -185,15 +190,26 @@ annotate service.salesorder with @(
         Data : [
             {
                 $Type: 'UI.DataField',
+                Value: SalesOrder,
+                Label : '{i18n>SalesOrder}',
+            },
+            {
+                $Type : 'UI.DataField',
+                Value : SalesOrderType,
+                Label : '{i18n>SalesOrderType}',
+            },
+            {
+                $Type : 'UI.DataField',
+                Value : SalesOrganization,
+                Label : '{i18n>Salesorganization}',
+            },
+            {
+                $Type: 'UI.DataField',
                 Value: createdBy,
             },
             {
                 $Type: 'UI.DataField',
                 Value: createdAt,
-            },
-            {
-                $Type: 'UI.DataField',
-                Value: SalesOrder,
             },
         ],
     },

@@ -3,7 +3,10 @@ using {API_SALES_ORDER_SRV as so} from './external/API_SALES_ORDER_SRV';
 using {API_BUSINESS_PARTNER as bp} from './external/API_BUSINESS_PARTNER';
 
 service SalesCatalogService {
-    entity salesorder             as projection on persistence.SalesOrderEntity;
+    entity salesorder             as projection on persistence.SalesOrderEntity actions {
+            @(Common.SideEffects.TargetEntities: ['/SalesCatalogService.EntityContainer/salesorder'])
+            action copySalesorder(in : $self) returns salesorder;
+        };
     entity SalesOrderItem         as projection on persistence.SalesOrderEntity.to_Item;
     // entity attachments            as projection on persistence.SalesOrderEntity.attachments;
 
