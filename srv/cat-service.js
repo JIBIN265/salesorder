@@ -640,11 +640,11 @@ class SalesCatalogService extends cds.ApplicationService {
 
                 return {
                     documentId: oSalesorder.documentId,
-                    salesorder: oSalesorder.salesorder,
+                    salesorder: oSalesorder.SalesOrder,
                     SalesOrderType: oSalesorder.SalesOrderType,
-                    message: oSalesorder.status,
+                    message: oSalesorder.Status,
                     url: url,
-                    indicator: oSalesorder.salesorder ? 'S' : 'E'
+                    indicator: oSalesorder.SalesOrder ? 'S' : 'E'
                 };
             } catch (error) {
                 console.error("Error posting invoice:", error);
