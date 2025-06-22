@@ -36,6 +36,7 @@ service SalesCatalogService {
         SalesOrderType : String(4);
         message : String;
         url : String;
+        indicator: String(1);
     };
 
     action postSalesWorkflow(currencyCode : String,
