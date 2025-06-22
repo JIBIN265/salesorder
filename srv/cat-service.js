@@ -2,8 +2,8 @@ const cds = require('@sap/cds');
 const SequenceHelper = require("./lib/SequenceHelper");
 const FormData = require('form-data');
 const { SELECT } = require('@sap/cds/lib/ql/cds-ql');
-const MAX_RETRIES = 30;
-const RETRY_DELAY_MS = 3000;
+const MAX_RETRIES = 60;
+const RETRY_DELAY_MS = 6000;
 const { executeHttpRequest } = require("@sap-cloud-sdk/http-client");
 
 class SalesCatalogService extends cds.ApplicationService {
@@ -277,6 +277,7 @@ class SalesCatalogService extends cds.ApplicationService {
                                 console.log('S/4HANA response:', response);
                                 req.data.SalesOrder = response.SalesOrder;
                                 req.data.SalesOrganization = response.SalesOrganization;
+                                req.data.Status = 'Sales Order Created';
                             } catch (error) {
                                 console.error('Error posting to S/4HANA:', error.message);
                                 req.error(500, 'Failed to create sales order in S/4HANA', error.message);
