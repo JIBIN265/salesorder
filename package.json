@@ -93,6 +93,12 @@
           "path": "/document/jobs"
         }
       },
+      "DocumentStore": {
+        "kind": "rest",
+        "credentials": {
+          "destination": "sap_process_automation_document_store"
+        }
+      },
       "API_SALES_ORDER_SRV": {
         "kind": "odata-v2",
         "csrf": true,

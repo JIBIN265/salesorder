@@ -27,6 +27,17 @@ service SalesCatalogService {
 
     annotate SalesCatalogService.salesorder with @odata.draft.enabled;
 
+    action postSalesOrder(
+                       senderMail : String,
+                       dmsFolder : String
+                       ) returns {
+        documentId : String(10);
+        salesorder : String(10);
+        SalesOrderType : String(4);
+        message : String;
+        url : String;
+    };
+
     action postSalesWorkflow(currencyCode : String,
                              documentDate : String,
                              documentNumber : String,
