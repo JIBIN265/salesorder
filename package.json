@@ -7,14 +7,13 @@
   "private": true,
   "dependencies": {
     "@aws-sdk/client-s3": "^3.670.0",
-    "@cap-js/attachments": "^1.1.7",
+    "@cap-js/hana": "^1",
     "@cap-js/sdm": "^1.2.2",
     "@sap-cloud-sdk/connectivity": "^3.9.0",
     "@sap-cloud-sdk/http-client": "^3.9.0",
     "@sap-cloud-sdk/resilience": "^3.9.0",
     "@sap-cloud-sdk/util": "^3.9.0",
     "@sap/approuter": "^16.9.0",
-    "@sap/cds-hana": "^2",
     "@sap/cds-mtxs": "^1.9",
     "@sap/eslint-plugin-cds": "^2.6.4",
     "@sap/ux-cds-odata-language-server-extension": "^1.12.0",
@@ -30,6 +29,7 @@
     "querystring": "^0.2.1"
   },
   "peerDependencies": {
+    "@cap-js/attachments": "1.2.1",
     "@sap/cds": "8.6.0"
   },
   "devDependencies": {
@@ -45,20 +45,13 @@
     "undeploy": "cf undeploy salesorder --delete-services --delete-service-keys --delete-service-brokers",
     "build": "rimraf resources mta_archives && mbt build --mtar archive",
     "deploy": "cf deploy mta_archives/archive.mtar --retries 1",
+    "hybrid": "cds watch --profile hybrid",
+    "kill": "lsof -i :4004 | grep LISTEN | awk '{print $2}' | xargs kill -9 || echo 'No process running on port 4004'",
     "clean": "rimraf \"**/*mta_archives\" \"**/*gen\" \"**/*resources\" \"**/*dist\" \"**/*node_modules\" \"**/*package-lock.json\"",
     "watch-salesorder": "cds watch --open salesorder/webapp/index.html?sap-ui-xx-viewCache=false",
     "all": "npm run clean && npm run cds && npm run build && npm run deploy"
   },
   "cds": {
-    "fiori": {
-      "lean_draft": true,
-      "bypass_draft": true
-    },
-    "server": {
-      "body_parser": {
-        "limit": "1mb"
-      }
-    },
     "requires": {
       "sdm": {
         "settings": {
@@ -71,19 +64,19 @@
         "impl": "@cap-js/sqlite",
         "credentials": {
           "url": "memory"
-        },
-        "attachments": {
-          "scan": false,
-          "kind": "db"
         }
       },
       "[production]": {
         "db": "hana",
-        "auth": "xsuaa"
+        "auth": "xsuaa",
+        "connectivity": true,
+        "destinations": true,
+        "html5-repo": true,
+        "application-logging": true
       },
       "[hybrid]": {
-        "auth": "xsuaa",
-        "db": "hana"
+        "db": "hana",
+        "auth": "dummy"
       },
       "BPA_WORKFLOW": {
         "kind": "rest",
