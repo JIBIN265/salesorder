@@ -1,6 +1,7 @@
-POST http://localhost:4004/odata/v4/inv-catalog/InvCatalogService.postSalesOrder
+POST http://localhost:4004/odata/v4/sales-catalog/SalesCatalogService.postSalesOrder
 Content-Type: application/json
+
 {
     "senderMail": "jibin.thomas@msitek.us",
-    "dmsFolder": "'spa-res:cmis:folderid:Fdvrdglf5AsxXWbToXHc7EGXDgXa_PVW3bnN3ErRwOE'"
+    "dmsFolder": "spa-res:cmis:folderid:21nAH28UCgzjqrMxId5gHaz2lm_dixsOPig8RLtWatQ"
 }

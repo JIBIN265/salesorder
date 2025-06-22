@@ -2,12 +2,9 @@ const cds = require('@sap/cds');
 const SequenceHelper = require("./lib/SequenceHelper");
 const FormData = require('form-data');
 const { SELECT } = require('@sap/cds/lib/ql/cds-ql');
-const LOG = cds.log('cat-service.js')
-const axios = require("axios");
-const { S3Client, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const MAX_RETRIES = 30;
 const RETRY_DELAY_MS = 3000;
-const { retrieveJwt, getDestination } = require("@sap-cloud-sdk/connectivity");
+const { executeHttpRequest } = require("@sap-cloud-sdk/http-client");
 
 class SalesCatalogService extends cds.ApplicationService {
     async init() {
@@ -293,7 +290,6 @@ class SalesCatalogService extends cds.ApplicationService {
                     //
                 } catch (error) {
                     console.error('Document extraction failed:', error.message);
-                    req.data.statusFlag = 'E';
                     req.data.status = error.message;
                 }
 
@@ -633,10 +629,9 @@ class SalesCatalogService extends cds.ApplicationService {
                 }
             };
 
-
             try {
                 const oSalesorder = await this.send({
-                    query: INSERT.into('A_SalesOrder').entries(newSalesorder.data),
+                    query: INSERT.into(salesorder).entries(newSalesorder.data),
                     event: "NEW",
                 });
 
