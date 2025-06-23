@@ -66,6 +66,8 @@ class SalesCatalogService extends cds.ApplicationService {
 
             const copiedsalesorder = Object.assign({}, originalsalesorder);
             delete copiedsalesorder.ID;  // Remove the ID to ensure a new entity is created
+            delete copiedsalesorder.SalesOrder;
+            delete copiedsalesorder.Status;
             delete copiedsalesorder.createdAt;
             delete copiedsalesorder.createdBy;
             delete copiedsalesorder.modifiedAt;
@@ -644,7 +646,7 @@ class SalesCatalogService extends cds.ApplicationService {
                     SalesOrderType: oSalesorder.SalesOrderType,
                     message: oSalesorder.Status,
                     url: url,
-                    indicator: oSalesorder.SalesOrder ? 'S' : 'E'
+                    indicator: oSalesorder.SalesOrder    ? 'S' : 'E'
                 };
             } catch (error) {
                 console.error("Error posting invoice:", error);
